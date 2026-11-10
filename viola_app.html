@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Viola">
+<meta name="theme-color" content="#1c1c1e">
+<title>Viola</title>
+<style>
+:root { color-scheme: dark; }
+body {
+  font-family: -apple-system, system-ui, sans-serif;
+  background: #1c1c1e; color: #f2f2f7;
+  margin: 0 auto; padding: 16px; max-width: 760px;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+h1 { font-size: 20px; margin: 4px 0 12px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+button {
+  font-size: 16px; padding: 10px 18px; border-radius: 10px;
+  border: 0; background: #0a84ff; color: #fff;
+}
+button:disabled { opacity: 0.4; }
+#score { background: #fff; border-radius: 10px; padding: 8px; overflow-x: auto; margin-bottom: 12px; }
+#score svg { max-width: 100%; }
+#status { min-height: 24px; font-size: 16px; margin: 8px 0; }
+#resumen { font-size: 16px; margin: 8px 0; }
+.leyenda { font-size: 13px; color: #aeaeb2; margin-bottom: 8px; }
+.compas { border-top: 1px solid #3a3a3c; padding: 10px 0; }
+.compas div { font-size: 15px; padding: 2px 0; }
+.comentario { color: #ffd60a; font-size: 15px; margin: 6px 0; min-height: 18px; }
+.compas button { font-size: 14px; padding: 6px 12px; background: #3a3a3c; }
+</style>
+</head>
+<body>
+<h1>Viola</h1>
+
+<div class="row">
+  <input type="file" id="archivo" accept=".xml,.musicxml,application/xml,text/xml">
+  <button id="grabar" disabled>Grabar</button>
+</div>
+
+<div id="status">Carga una partitura en formato MusicXML.</div>
+<div id="score"></div>
+<div class="leyenda">Verde: correcta. Naranja: desafinada. Rojo: nota incorrecta. Amarillo: ritmo. Gris: no tocada.</div>
+<div id="resumen"></div>
+<div id="compases"></div>
+
+<script src="https://www.verovio.org/javascript/latest/verovio-toolkit-wasm.js"></script>
+<script>
+const TOL = 25;   // cents
+const GAP = 2;    // coste de saltar una nota en la alineación
+const NOTAS = ['Do', 'Do#', 'Re', 'Re#', 'Mi', 'Fa', 'Fa#', 'Sol', 'Sol#', 'La', 'La#', 'Si'];
+const STEP = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+const COLOR = { ok: '#30d158', desafinada: '#ff9f0a', incorrecta: '#ff453a', ritmo: '#ffd60a', 'no tocada': '#8e8e93' };
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function nombre(midi) { return NOTAS[midi % 12] + (Math.floor(midi / 12) - 1); }
+function nombreDeFrecuencia(f) { return nombre(Math.round(69 + 12 * Math.log2(f / 440))); }
+function mediana(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  return s.length ? s[Math.floor(s.length / 2)] : 0;
+}
+
+// ---------- Detección de tono (autocorrelación) ----------
+function detectarTono(buf, sr) {
+  const minLag = Math.floor(sr / 1000);
+  const maxLag = Math.floor(sr / 100);
+  const n = buf.length - maxLag - 2;
+  let e0 = 0;
+  for (let i = 0; i < n; i++) e0 += buf[i] * buf[i];
+  if (e0 / n < 0.0001) return null;
+  const corr = new Float32Array(maxLag + 2);
+  let maxC = 0;
+  for (let lag = minLag - 1; lag <= maxLag + 1; lag++) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += buf[i] * buf[i + lag];
+    corr[lag] = s;
+    if (lag >= minLag && lag <= maxLag && s > maxC) maxC = s;
+  }
+  if (maxC < 0.5 * e0) return null;
+  for (let l = minLag; l <= maxLag; l++) {
+    if (corr[l] >= 0.9 * maxC && corr[l] > corr[l - 1] && corr[l] >= corr[l + 1]) {
+      const y0 = corr[l - 1], y1 = corr[l], y2 = corr[l + 1];
+      const den = y0 - 2 * y1 + y2;
+      const shift = den === 0 ? 0 : 0.5 * (y0 - y2) / den;
+      return sr / (l + shift);
+    }
+  }
+  return null;
+}
+
+// ---------- Micrófono ----------
+let ctx = null, analyser = null, stream = null;
+async function prepararMic() {
+  if (!analyser) {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    src.connect(analyser);
+  }
+  if (ctx.state === 'suspended') await ctx.resume();
+}
+
+// ---------- Partitura MusicXML ----------
+let partitura = null; // { nombre, xml, notas: [{midi, dur, measure, id}] }
+
+function leerPartitura(texto, nombreArchivo) {
+  const doc = new DOMParser().parseFromString(texto, 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('el XML no es válido');
+  const parte = doc.querySelector('part');
+  if (!parte) throw new Error('no hay ninguna parte en el archivo');
+  let division = 1;
+  const notas = [];
+  let k = 0;
+  for (const compas of parte.querySelectorAll(':scope > measure')) {
+    const num = compas.getAttribute('number');
+    for (const el of compas.children) {
+      if (el.tagName === 'attributes') {
+        const d = el.querySelector('divisions');
+        if (d) division = parseFloat(d.textContent);
+      }
+      if (el.tagName === 'note' && !el.querySelector('chord') && !el.querySelector('rest')) {
+        const p = el.querySelector('pitch');
+        if (!p) continue;
+        const step = p.querySelector('step').textContent;
+        const alter = parseFloat(p.querySelector('alter')?.textContent || '0');
+        const oct = parseInt(p.querySelector('octave').textContent, 10);
+        const midi = (oct + 1) * 12 + STEP[step] + alter;
+        const dur = parseFloat(el.querySelector('duration')?.textContent || '0') / division;
+        el.setAttribute('xml:id', 'n' + k);
+        notas.push({ midi, dur, measure: num, id: 'n' + k });
+        k++;
+      }
+    }
+  }
+  if (!notas.length) throw new Error('no se han encontrado notas');
+  return { nombre: nombreArchivo, xml: new XMLSerializer().serializeToString(doc), notas };
+}
+
+// ---------- Visor (Verovio) ----------
+let vrv = null;
+if (typeof verovio !== 'undefined') {
+  verovio.module.onRuntimeInitialized = () => {
+    vrv = new verovio.toolkit();
+    vrv.setOptions({ scale: 40, pageWidth: 1800, adjustPageHeight: true });
+  };
+}
+
+function renderPartitura() {
+  const cont = $('score');
+  cont.innerHTML = '';
+  if (!vrv) {
+    cont.textContent = 'No se ha cargado el visor de partituras. Revisa la conexión. El análisis sigue funcionando.';
+    return;
+  }
+  vrv.loadData(partitura.xml);
+  const paginas = vrv.getPageCount();
+  for (let p = 1; p <= paginas; p++) {
+    const div = document.createElement('div');
+    div.innerHTML = vrv.renderToSVG(p);
+    cont.appendChild(div);
+  }
+  cont.querySelectorAll('svg').forEach(s => { s.style.width = '100%'; s.style.height = 'auto'; });
+}
+
+function pintarNota(id, estado) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const color = COLOR[estado];
+  el.querySelectorAll('*').forEach(c => { c.style.fill = color; c.style.stroke = color; });
+}
+
+// ---------- Grabación y segmentación ----------
+let grabando = false, frames = [], timer = null, t0 = 0;
+
+function segmentar(fr) {
+  const segs = [];
+  let cur = null, gap = 0;
+  for (const x of fr) {
+    if (x.f) {
+      const m = 69 + 12 * Math.log2(x.f / 440);
+      const r = Math.round(m);
+      if (cur && cur.r === r) {
+        cur.end = x.t; cur.cents.push((m - r) * 100); gap = 0;
+      } else {
+        if (cur) segs.push(cur);
+        cur = { r, start: x.t, end: x.t, cents: [(m - r) * 100] };
+        gap = 0;
+      }
+    } else if (cur) {
+      gap++;
+      if (gap > 3) { segs.push(cur); cur = null; gap = 0; }
+    }
+  }
+  if (cur) segs.push(cur);
+  return segs
+    .filter(s => s.end - s.start >= 80)
+    .map(s => ({ midi: s.r, dur: (s.end - s.start) / 1000, cents: mediana(s.cents) }));
+}
+
+// Alineación global (Needleman-Wunsch) entre partitura y lo tocado
+function alinear(S, P) {
+  const n = S.length, m = P.length;
+  const D = [], B = [];
+  for (let i = 0; i <= n; i++) { D.push(new Float64Array(m + 1)); B.push(new Uint8Array(m + 1)); }
+  for (let i = 1; i <= n; i++) { D[i][0] = i * GAP; B[i][0] = 1; }
+  for (let j = 1; j <= m; j++) { D[0][j] = j * GAP; B[0][j] = 2; }
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      const c = Math.min(Math.abs(S[i - 1].midi - P[j - 1].midi), 2.5);
+      const dia = D[i - 1][j - 1] + c;
+      const up = D[i - 1][j] + GAP;
+      const left = D[i][j - 1] + GAP;
+      if (dia <= up && dia <= left) { D[i][j] = dia; B[i][j] = 0; }
+      else if (up <= left) { D[i][j] = up; B[i][j] = 1; }
+      else { D[i][j] = left; B[i][j] = 2; }
+    }
+  }
+  const pares = [];
+  let i = n, j = m;
+  while (i > 0 || j > 0) {
+    const b = i === 0 ? 2 : j === 0 ? 1 : B[i][j];
+    if (b === 0) { pares.unshift({ s: i - 1, p: j - 1 }); i--; j--; }
+    else if (b === 1) { pares.unshift({ s: i - 1, p: null }); i--; }
+    else { pares.unshift({ s: null, p: j - 1 }); j--; }
+  }
+  return pares;
+}
+
+function evaluar(S, P, pares) {
+  const res = S.map((n, i) => ({
+    i, measure: n.measure, esperada: nombre(n.midi),
+    estado: 'no tocada', detectada: '—', motivo: 'No se ha tocado', ratio: null
+  }));
+  const extras = [];
+  for (const par of pares) {
+    if (par.p === null) continue;
+    if (par.s === null) { extras.push(nombre(P[par.p].midi)); continue; }
+    const r = res[par.s];
+    const p = P[par.p];
+    r.detectada = nombre(p.midi);
+    r.ratio = p.dur / S[par.s].dur;
+    const diff = p.midi - S[par.s].midi;
+    if (diff !== 0) {
+      r.estado = 'incorrecta';
+      r.motivo = `Tocada ${nombre(p.midi)}`;
+      continue;
+    }
+    const c = Math.round(p.cents);
+    const signo = c > 0 ? '+' : '';
+    if (Math.abs(c) > TOL) {
+      r.estado = 'desafinada';
+      r.motivo = `${c > 0 ? 'Alta' : 'Baja'} (${signo}${c} cents)`;
+    } else {
+      r.estado = 'ok';
+      r.motivo = `Afinada (${signo}${c} cents)`;
+    }
+  }
+  // Ritmo: comparar cada duración con la mediana (así no hace falta conocer el tempo)
+  const med = mediana(res.filter(r => r.ratio).map(r => r.ratio));
+  for (const r of res) {
+    if (!r.ratio || !med) continue;
+    const rel = r.ratio / med;
+    if (r.estado === 'ok' && (rel > 1.6 || rel < 0.6)) {
+      r.estado = 'ritmo';
+      r.motivo = rel > 1 ? 'Nota demasiado larga' : 'Nota demasiado corta';
+    }
+  }
+  return { res, extras };
+}
+
+function analizar(fr) {
+  const segs = segmentar(fr);
+  if (segs.length === 0) {
+    $('status').textContent = 'No se ha detectado nada. Prueba a tocar más fuerte y más cerca del micrófono.';
+    return;
+  }
+  const pares = alinear(partitura.notas, segs);
+  const ev = evaluar(partitura.notas, segs, pares);
+  partitura.notas.forEach((n, i) => pintarNota(n.id, ev.res[i].estado));
+  const correctas = ev.res.filter(r => r.estado === 'ok').length;
+  $('resumen').textContent = `Resultado: ${correctas} de ${ev.res.length} notas correctas.` +
+    (ev.extras.length ? ` Notas de más detectadas: ${ev.extras.length}.` : '');
+  $('status').textContent = 'Análisis terminado. Toca un compás para comentarlo.';
+  mostrarCompases(ev.res);
+}
+
+// ---------- Comentarios por compás ----------
+function localGet(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+function localSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+function mostrarCompases(res) {
+  const cont = $('compases');
+  cont.innerHTML = '';
+  const medidas = [...new Set(partitura.notas.map(n => n.measure))];
+  for (const m of medidas) {
+    const bloque = document.createElement('div');
+    bloque.className = 'compas';
+    const h = document.createElement('strong');
+    h.textContent = `Compás ${m}`;
+    bloque.appendChild(h);
+    if (res) {
+      res.filter(r => r.measure === m).forEach(r => {
+        const linea = document.createElement('div');
+        linea.textContent = `${r.esperada}: ${r.detectada !== '—' ? 'tocada ' + r.detectada + ' · ' : ''}${r.motivo}`;
+        bloque.appendChild(linea);
+      });
+    }
+    const clave = `viola|${partitura.nombre}|${m}`;
+    const com = document.createElement('div');
+    com.className = 'comentario';
+    com.textContent = localGet(clave);
+    const b = document.createElement('button');
+    b.textContent = 'Comentar';
+    b.addEventListener('click', () => {
+      const t = prompt(`Comentario para el compás ${m}`, localGet(clave));
+      if (t !== null) { localSet(clave, t); com.textContent = t; }
+    });
+    bloque.appendChild(com);
+    bloque.appendChild(b);
+    cont.appendChild(bloque);
+  }
+}
+
+// ---------- Eventos ----------
+$('archivo').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    partitura = leerPartitura(await f.text(), f.name);
+  } catch (err) {
+    $('status').textContent = 'No se ha podido leer el archivo: ' + err.message + '. Si es un .mxl, expórtalo como .musicxml.';
+    return;
+  }
+  $('grabar').disabled = false;
+  $('resumen').textContent = '';
+  renderPartitura();
+  mostrarCompases(null);
+  $('status').textContent = `Partitura cargada: ${partitura.notas.length} notas. Pulsa Grabar cuando quieras empezar.`;
+});
+
+$('grabar').addEventListener('click', async () => {
+  if (!grabando) {
+    try { await prepararMic(); }
+    catch (e) { $('status').textContent = 'No se ha podido acceder al micrófono.'; return; }
+    frames = [];
+    grabando = true;
+    t0 = performance.now();
+    const buf = new Float32Array(analyser.fftSize);
+    timer = setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      frames.push({ t: performance.now() - t0, f: detectarTono(buf, ctx.sampleRate) });
+    }, 30);
+    $('grabar').textContent = 'Parar y analizar';
+    $('status').textContent = 'Grabando...';
+  } else {
+    clearInterval(timer);
+    grabando = false;
+    $('grabar').textContent = 'Grabar';
+    analizar(frames);
+  }
+});
+</script>
+</body>
+</html>
