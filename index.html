@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Viola">
+<meta name="theme-color" content="#1c1c1e">
+<title>Prototipo de viola</title>
+<style>
+:root { color-scheme: dark; }
+body {
+  font-family: -apple-system, system-ui, sans-serif;
+  background: #1c1c1e; color: #f2f2f7;
+  margin: 0 auto; padding: 16px; max-width: 640px;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+h1 { font-size: 20px; margin: 4px 0 12px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+label { font-size: 15px; }
+button {
+  font-size: 16px; padding: 10px 18px; border-radius: 10px;
+  border: 0; background: #0a84ff; color: #fff;
+}
+button:disabled { opacity: 0.4; }
+input {
+  font-size: 16px; width: 70px; padding: 8px; border-radius: 8px;
+  border: 1px solid #444; background: #2c2c2e; color: #fff;
+}
+#notes { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.note {
+  width: 70px; padding: 12px 0; text-align: center; font-size: 16px;
+  border-radius: 10px; background: #2c2c2e;
+}
+.note.active { background: #ffd60a; color: #000; }
+.note.ok { background: #30d158; color: #000; }
+.note.bad { background: #ff453a; color: #000; }
+#status { min-height: 24px; font-size: 16px; margin: 8px 0; }
+#live { font-size: 15px; color: #aeaeb2; min-height: 20px; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; margin-top: 12px; }
+th, td { padding: 8px 6px; border-bottom: 1px solid #3a3a3c; text-align: left; }
+</style>
+</head>
+<body>
+<h1>Prototipo de viola</h1>
+
+<div class="row">
+  <label>Tempo (bpm)&nbsp;<input id="bpm" type="number" value="60" min="1" max="120"></label>
+  <button id="start">Empezar</button>
+</div>
+
+<div id="notes"></div>
+<div id="status">Pulsa Empezar y toca cada nota cuando se ilumine.</div>
+<div id="live"></div>
+<table id="results"></table>
+
+<script>
+// Ejercicio en sonido real (números MIDI). 48 = Do3, que es la cuerda al aire más grave de la viola.
+const EJERCICIO = [48, 50, 52, 53, 55, 57, 55, 53, 52, 50, 48];
+const TOLERANCIA_CENTS = 25;
+const NOTAS = ['Do', 'Do#', 'Re', 'Re#', 'Mi', 'Fa', 'Fa#', 'Sol', 'Sol#', 'La', 'La#', 'Si'];
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function nombre(midi) {
+  return NOTAS[midi % 12] + (Math.floor(midi / 12) - 1);
+}
+function nombreDeFrecuencia(f) {
+  return nombre(Math.round(69 + 12 * Math.log2(f / 440)));
+}
+
+// Detección de tono por autocorrelación con interpolación parabólica
+function detectarTono(buf, sr) {
+  const minLag = Math.floor(sr / 1000);
+  const maxLag = Math.floor(sr / 100);
+  const n = buf.length - maxLag - 2;
+
+  let e0 = 0;
+  for (let i = 0; i < n; i++) e0 += buf[i] * buf[i];
+  if (e0 / n < 0.0001) return null; // silencio o ruido muy bajo
+
+  const corr = new Float32Array(maxLag + 2);
+  let maxC = 0;
+  for (let lag = minLag - 1; lag <= maxLag + 1; lag++) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += buf[i] * buf[i + lag];
+    corr[lag] = s;
+    if (lag >= minLag && lag <= maxLag && s > maxC) maxC = s;
+  }
+  if (maxC < 0.5 * e0) return null; // señal poco periódica
+
+  // Primer pico cercano al máximo: evita errores de octava
+  for (let l = minLag; l <= maxLag; l++) {
+    if (corr[l] >= 0.9 * maxC && corr[l] > corr[l - 1] && corr[l] >= corr[l + 1]) {
+      const y0 = corr[l - 1], y1 = corr[l], y2 = corr[l + 1];
+      const den = y0 - 2 * y1 + y2;
+      const shift = den === 0 ? 0 : 0.5 * (y0 - y2) / den;
+      return sr / (l + shift);
+    }
+  }
+  return null;
+}
+
+let ctx = null, analyser = null, stream = null;
+
+async function prepararMic() {
+  if (!analyser) {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    src.connect(analyser);
+  }
+  if (ctx.state === 'suspended') await ctx.resume();
+}
+
+async function capturar(ms) {
+  const buf = new Float32Array(analyser.fftSize);
+  const est = [];
+  const t0 = performance.now();
+  while (performance.now() - t0 < ms) {
+    analyser.getFloatTimeDomainData(buf);
+    if (performance.now() - t0 > 150) { // ignorar el ataque
+      const f = detectarTono(buf, ctx.sampleRate);
+      if (f) {
+        est.push(f);
+        $('live').textContent = 'Suena: ' + nombreDeFrecuencia(f);
+      }
+    }
+    await sleep(40);
+  }
+  return est;
+}
+
+function evaluar(est, midi) {
+  if (est.length < 4) return { ok: false, detectada: '—', motivo: 'Sin sonido suficiente' };
+  est.sort((a, b) => a - b);
+  const f = est[Math.floor(est.length / 2)];
+  const dif = (69 + 12 * Math.log2(f / 440)) - midi; // en semitonos
+  const detectada = nombreDeFrecuencia(f);
+  if (Math.abs(dif) > 0.5) return { ok: false, detectada, motivo: 'Nota incorrecta' };
+  const c = Math.round(dif * 100);
+  const signo = c > 0 ? '+' : '';
+  if (Math.abs(c) <= TOLERANCIA_CENTS) return { ok: true, detectada, motivo: `Afinada (${signo}${c} cents)` };
+  return { ok: false, detectada, motivo: `Desafinada ${c > 0 ? 'alta' : 'baja'} (${signo}${c} cents)` };
+}
+
+function renderNotas() {
+  const c = $('notes');
+  c.innerHTML = '';
+  EJERCICIO.forEach((m, i) => {
+    const d = document.createElement('div');
+    d.className = 'note';
+    d.id = 'n' + i;
+    d.textContent = nombre(m);
+    c.appendChild(d);
+  });
+}
+
+function setNota(i, clase) {
+  $('n' + i).className = 'note ' + clase;
+}
+
+function mostrarResultados(filas) {
+  const t = $('results');
+  t.innerHTML = '';
+  const cab = document.createElement('tr');
+  ['Nota', 'Detectada', 'Resultado'].forEach(txt => {
+    const th = document.createElement('th');
+    th.textContent = txt;
+    cab.appendChild(th);
+  });
+  t.appendChild(cab);
+  filas.forEach(f => {
+    const tr = document.createElement('tr');
+    [f.esperada, f.detectada, f.motivo].forEach(txt => {
+      const td = document.createElement('td');
+      td.textContent = txt;
+      tr.appendChild(td);
+    });
+    t.appendChild(tr);
+  });
+}
+
+async function run() {
+  const btn = $('start');
+  const bpmLeido = parseInt($('bpm').value, 10);
+  const bpm = Math.min(120, Math.max(1, isNaN(bpmLeido) ? 60 : bpmLeido));
+  const beatMs = 60000 / bpm;
+  btn.disabled = true;
+  $('results').innerHTML = '';
+  renderNotas();
+
+  try {
+    await prepararMic();
+  } catch (e) {
+    $('status').textContent = 'No se ha podido acceder al micrófono. Revisa los permisos de Safari.';
+    btn.disabled = false;
+    return;
+  }
+
+  const filas = [];
+  for (let i = 0; i < EJERCICIO.length; i++) {
+    setNota(i, 'active');
+    $('status').textContent = `Toca ${nombre(EJERCICIO[i])} (nota ${i + 1} de ${EJERCICIO.length})`;
+    const est = await capturar(beatMs);
+    const r = evaluar(est, EJERCICIO[i]);
+    setNota(i, r.ok ? 'ok' : 'bad');
+    filas.push({ esperada: nombre(EJERCICIO[i]), ...r });
+  }
+
+  mostrarResultados(filas);
+  const correctas = filas.filter(f => f.ok).length;
+  $('status').textContent = `Resultado: ${correctas} de ${filas.length} notas correctas.`;
+  $('live').textContent = '';
+  btn.disabled = false;
+  btn.textContent = 'Repetir';
+}
+
+$('start').addEventListener('click', run);
+renderNotas();
+</script>
+</body>
+</html>
