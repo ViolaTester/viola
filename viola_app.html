@@ -51,7 +51,7 @@ button:disabled { opacity: 0.4; }
 <script>
 const TOL = 25;   // cents
 const GAP = 2;    // coste de saltar una nota en la alineación
-const NOTAS = ['Do', 'Do#', 'Re', 'Re#', 'Mi', 'Fa', 'Fa#', 'Sol', 'Sol#', 'La', 'La#', 'Si'];
+const NOTAS = ['Do', 'Re♭', 'Re', 'Mi♭', 'Mi', 'Fa', 'Sol♭', 'Sol', 'La♭', 'La', 'Si♭', 'Si'];
 const STEP = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
 const COLOR = { ok: '#30d158', desafinada: '#ff9f0a', incorrecta: '#ff453a', ritmo: '#ffd60a', 'no tocada': '#8e8e93' };
 
@@ -120,8 +120,10 @@ function leerPartitura(texto, nombreArchivo) {
   let division = 1;
   const notas = [];
   let k = 0;
+  let nCompas = 0;
   for (const compas of parte.querySelectorAll(':scope > measure')) {
-    const num = compas.getAttribute('number');
+    nCompas++;
+    const num = String(nCompas); // numeración por posición, por si el archivo repite números
     for (const el of compas.children) {
       if (el.tagName === 'attributes') {
         const d = el.querySelector('divisions');
@@ -211,7 +213,8 @@ function alinear(S, P) {
   const n = S.length, m = P.length;
   const D = [], B = [];
   for (let i = 0; i <= n; i++) { D.push(new Float64Array(m + 1)); B.push(new Uint8Array(m + 1)); }
-  for (let i = 1; i <= n; i++) { D[i][0] = i * GAP; B[i][0] = 1; }
+  // Alineación semiglobal: se puede empezar en cualquier nota de la partitura y acabar en cualquiera
+  for (let i = 0; i <= n; i++) { D[i][0] = 0; B[i][0] = 1; }
   for (let j = 1; j <= m; j++) { D[0][j] = j * GAP; B[0][j] = 2; }
   for (let i = 1; i <= n; i++) {
     for (let j = 1; j <= m; j++) {
@@ -224,10 +227,13 @@ function alinear(S, P) {
       else { D[i][j] = left; B[i][j] = 2; }
     }
   }
+  // Final libre: la mejor casilla de la última columna marca dónde acaba lo tocado
+  let iFin = 0, mejor = Infinity;
+  for (let k = 0; k <= n; k++) if (D[k][m] < mejor) { mejor = D[k][m]; iFin = k; }
   const pares = [];
-  let i = n, j = m;
-  while (i > 0 || j > 0) {
-    const b = i === 0 ? 2 : j === 0 ? 1 : B[i][j];
+  let i = iFin, j = m;
+  while (j > 0) {
+    const b = i === 0 ? 2 : B[i][j];
     if (b === 0) { pares.unshift({ s: i - 1, p: j - 1 }); i--; j--; }
     else if (b === 1) { pares.unshift({ s: i - 1, p: null }); i--; }
     else { pares.unshift({ s: null, p: j - 1 }); j--; }
